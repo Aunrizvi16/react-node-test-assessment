@@ -9,7 +9,6 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 // Configure storage
-const multerORM = require('multer-orm');
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadsDir);

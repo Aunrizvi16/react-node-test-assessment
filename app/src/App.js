@@ -1,10 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
+import {
+  getPusherClient,
+  isPusherConfigured,
+  MESSAGES_CHANNEL,
+  EVENTS,
+} from './pusher';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
 
 function App() {
+  // `messages` is the live, Pusher-powered feed. It is always kept current
+  // (even while a search is active) so clearing the search resumes seamlessly.
   const [messages, setMessages] = useState([]);
   const [username, setUsername] = useState('');
   const [messageText, setMessageText] = useState('');
@@ -12,17 +20,96 @@ function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Search state. When `searchQuery` is non-empty we show `searchResults`
+  // instead of the live feed; the feed keeps updating in the background.
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+
+  const isSearching = searchQuery.trim().length > 0;
+  const displayedMessages = isSearching ? searchResults : messages;
 
   useEffect(() => {
     fetchMessages();
   }, []);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Subscribe to Pusher and live-update the feed. Runs once on mount.
   useEffect(() => {
+    if (!isPusherConfigured) return undefined;
+
+    const client = getPusherClient();
+    if (!client) return undefined;
+
+    const channel = client.subscribe(MESSAGES_CHANNEL);
+
+    const handleNewMessage = (newMessage) => {
+      if (!newMessage || !newMessage.id) return;
+      setMessages((prev) => {
+        // Guard against duplicates (e.g. the sender's own optimistic append).
+        if (prev.some((msg) => msg.id === newMessage.id)) {
+          return prev;
+        }
+        return [...prev, newMessage];
+      });
+    };
+
+    const handleMessageDeleted = (payload) => {
+      const deletedId = payload && payload.id;
+      if (!deletedId) return;
+      setMessages((prev) => prev.filter((msg) => msg.id !== deletedId));
+      // Also drop it from any active search results.
+      setSearchResults((prev) => prev.filter((msg) => msg.id !== deletedId));
+    };
+
+    channel.bind(EVENTS.NEW_MESSAGE, handleNewMessage);
+    channel.bind(EVENTS.MESSAGE_DELETED, handleMessageDeleted);
+
+    return () => {
+      channel.unbind(EVENTS.NEW_MESSAGE, handleNewMessage);
+      channel.unbind(EVENTS.MESSAGE_DELETED, handleMessageDeleted);
+      client.unsubscribe(MESSAGES_CHANNEL);
+    };
+  }, []);
+
+  // Debounced search (300ms). Hits the search endpoint while the query is
+  // non-empty; clearing the query returns to the live feed.
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+
+    if (!trimmed) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      return undefined;
+    }
+
+    setSearchLoading(true);
+    const timeoutId = setTimeout(async () => {
+      try {
+        const response = await axios.get(`${API_BASE_URL}/api/messages/search`, {
+          params: { q: trimmed },
+        });
+        setSearchResults(response.data.messages || []);
+      } catch (err) {
+        console.error('Error searching messages:', err);
+        setSearchResults([]);
+      } finally {
+        setSearchLoading(false);
+      }
+    }, 300);
+
+    return () => clearTimeout(timeoutId);
+  }, [searchQuery]);
+
+  // Auto-scroll to the bottom of the live feed as new messages arrive.
+  // Skipped while searching so search results are not yanked around.
+  useEffect(() => {
+    if (isSearching) return;
     scrollToBottom();
-  }, [messages]);
+  }, [messages, isSearching]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -150,6 +237,36 @@ function App() {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
+  const renderMessage = (msg) => (
+    <div key={msg.id} className="message-item">
+      <div className="message-header">
+        <span className="message-username">{msg.username}</span>
+        <span className="message-time">{formatTime(msg.created_at)}</span>
+      </div>
+      {msg.image_url && (
+        <div className="message-image">
+          <img
+            src={`${API_BASE_URL}${msg.image_url}`}
+            alt="Shared"
+            onError={(e) => {
+              e.target.style.display = 'none';
+            }}
+          />
+        </div>
+      )}
+      {msg.message && (
+        <div className="message-text">{msg.message}</div>
+      )}
+      <button
+        className="delete-message-btn"
+        onClick={() => handleDeleteMessage(msg.id)}
+        title="Delete message"
+      >
+        ×
+      </button>
+    </div>
+  );
+
   return (
     <div className="App">
       <header className="App-header">
@@ -158,43 +275,42 @@ function App() {
       </header>
 
       <main className="chat-container">
+        <div className="search-bar">
+          <input
+            type="text"
+            placeholder="🔍 Search messages..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            aria-label="Search messages"
+          />
+          {isSearching && (
+            <span className="search-status">
+              {searchLoading
+                ? 'Searching…'
+                : `${searchResults.length} result${searchResults.length === 1 ? '' : 's'}`}
+            </span>
+          )}
+        </div>
+
         <div className="chat-messages" id="messages-container">
-          {loading && messages.length === 0 ? (
+          {isSearching ? (
+            searchLoading && searchResults.length === 0 ? (
+              <div className="loading">Searching messages...</div>
+            ) : searchResults.length === 0 ? (
+              <div className="no-messages">
+                No messages match &ldquo;{searchQuery.trim()}&rdquo;.
+              </div>
+            ) : (
+              displayedMessages.map(renderMessage)
+            )
+          ) : loading && messages.length === 0 ? (
             <div className="loading">Loading messages...</div>
           ) : messages.length === 0 ? (
             <div className="no-messages">
               No messages yet. Start the conversation!
             </div>
           ) : (
-            messages.map((msg) => (
-              <div key={msg.id} className="message-item">
-                <div className="message-header">
-                  <span className="message-username">{msg.username}</span>
-                  <span className="message-time">{formatTime(msg.created_at)}</span>
-                </div>
-                {msg.image_url && (
-                  <div className="message-image">
-                    <img 
-                      src={`${API_BASE_URL}${msg.image_url}`} 
-                      alt="Shared" 
-                      onError={(e) => {
-                        e.target.style.display = 'none';
-                      }}
-                    />
-                  </div>
-                )}
-                {msg.message && (
-                  <div className="message-text">{msg.message}</div>
-                )}
-                <button
-                  className="delete-message-btn"
-                  onClick={() => handleDeleteMessage(msg.id)}
-                  title="Delete message"
-                >
-                  ×
-                </button>
-              </div>
-            ))
+            displayedMessages.map(renderMessage)
           )}
           <div ref={messagesEndRef} />
         </div>
